@@ -27,8 +27,6 @@ from aesara.link.jax.dispatch import jax_funcify
 
 from pymc import Model, modelcontext
 from pymc.aesaraf import compile_rv_inplace
-from pymc.backends.arviz import find_observations
-from pymc.distributions import logpt
 from pymc.util import get_default_varnames
 
 warnings.warn("This module is experimental.")
@@ -48,7 +46,6 @@ def jax_funcify_Assert(op, **kwargs):
 
 def replace_shared_variables(graph: List[TensorVariable]) -> List[TensorVariable]:
     """Replace shared variables in graph by their constant values
-
     Raises
     ------
     ValueError
@@ -97,40 +94,6 @@ def get_jaxified_logp(model: Model) -> Callable:
     return logp_fn_wrap
 
 
-# Adopted from arviz numpyro extractor
-def _sample_stats_to_xarray(posterior):
-    """Extract sample_stats from NumPyro posterior."""
-    rename_key = {
-        "potential_energy": "lp",
-        "adapt_state.step_size": "step_size",
-        "num_steps": "n_steps",
-        "accept_prob": "acceptance_rate",
-    }
-    data = {}
-    for stat, value in posterior.get_extra_fields(group_by_chain=True).items():
-        if isinstance(value, (dict, tuple)):
-            continue
-        name = rename_key.get(stat, stat)
-        value = value.copy()
-        data[name] = value
-        if stat == "num_steps":
-            data["tree_depth"] = np.log2(value).astype(int) + 1
-    return data
-
-
-def _get_log_likelihood(model, samples):
-    "Compute log-likelihood for all observations"
-    data = {}
-    for v in model.observed_RVs:
-        logp_v = replace_shared_variables([logpt(v)])
-        fgraph = FunctionGraph(model.value_vars, logp_v, clone=False)
-        optimize_graph(fgraph, include=["fast_run"], exclude=["cxx_only", "BlasOpt"])
-        jax_fn = jax_funcify(fgraph)
-        result = jax.jit(jax.vmap(jax.vmap(jax_fn)))(*samples)[0]
-        data[v.name] = result
-    return data
-
-
 def sample_numpyro_nuts(
     draws=1000,
     tune=1000,
@@ -151,20 +114,6 @@ def sample_numpyro_nuts(
 
     vars_to_sample = list(get_default_varnames(var_names, include_transformed=keep_untransformed))
 
-    coords = {
-        cname: np.array(cvals) if isinstance(cvals, tuple) else cvals
-        for cname, cvals in model.coords.items()
-        if cvals is not None
-    }
-
-    if hasattr(model, "RV_dims"):
-        dims = {
-            var_name: [dim for dim in dims if dim is not None]
-            for var_name, dims in model.RV_dims.items()
-        }
-    else:
-        dims = {}
-
     tic1 = pd.Timestamp.now()
     print("Compiling...", file=sys.stdout)
 
@@ -173,6 +122,7 @@ def sample_numpyro_nuts(
     init_state_batched = jax.tree_map(lambda x: np.repeat(x[None, ...], chains, axis=0), init_state)
 
     logp_fn = get_jaxified_logp(model)
+    fn = model.fastfn(vars_to_sample)
 
     nuts_kernel = NUTS(
         potential_fn=logp_fn,
@@ -201,23 +151,9 @@ def sample_numpyro_nuts(
     map_seed = jax.random.split(seed, chains)
 
     if chains == 1:
-        init_params = init_state
-        map_seed = seed
+        pmap_numpyro.run(seed, init_params=init_state, extra_fields=("num_steps",))
     else:
-        init_params = init_state_batched
-
-    pmap_numpyro.run(
-        map_seed,
-        init_params=init_params,
-        extra_fields=(
-            "num_steps",
-            "potential_energy",
-            "energy",
-            "adapt_state.step_size",
-            "accept_prob",
-            "diverging",
-        ),
-    )
+        pmap_numpyro.run(map_seed, init_params=init_state_batched, extra_fields=("num_steps",))
 
     raw_mcmc_samples = pmap_numpyro.get_samples(group_by_chain=True)
 
@@ -227,23 +163,27 @@ def sample_numpyro_nuts(
     print("Transforming variables...", file=sys.stdout)
     mcmc_samples = {}
     for v in vars_to_sample:
-        fgraph = FunctionGraph(model.value_vars, [v], clone=False)
-        optimize_graph(fgraph, include=["fast_run"], exclude=["cxx_only", "BlasOpt"])
-        jax_fn = jax_funcify(fgraph)
-        result = jax.vmap(jax.vmap(jax_fn))(*raw_mcmc_samples)[0]
-        mcmc_samples[v.name] = result
+        mcmc_samples[v.name] = []
+
+    for i in range(draws):
+        for c in range(chains):
+            draw = {
+                value_var.name: raw_samples[c, i]
+                for value_var, raw_samples in zip(model.value_vars, raw_mcmc_samples)
+            }
+            sample = fn(draw)
+            for vi, v in enumerate(vars_to_sample):
+                mcmc_samples[v.name].append(sample[vi])
+
+    for v in vars_to_sample:
+        mcmc_samples[v.name] = np.array(mcmc_samples[v.name]).reshape(
+            (chains, draws) + mcmc_samples[v.name][-1].shape
+        )
 
     tic4 = pd.Timestamp.now()
     print("Transformation time = ", tic4 - tic3, file=sys.stdout)
 
     posterior = mcmc_samples
-    az_trace = az.from_dict(
-        posterior=posterior,
-        log_likelihood=_get_log_likelihood(model, raw_mcmc_samples),
-        observed_data=find_observations(model),
-        sample_stats=_sample_stats_to_xarray(pmap_numpyro),
-        coords=coords,
-        dims=dims,
-    )
+    az_trace = az.from_dict(posterior=posterior)
 
     return az_trace
